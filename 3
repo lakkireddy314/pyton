@@ -1,0 +1,572 @@
+variables, and what each file does.
+This version publishes ONLY Inv_cert_plan_<awx_inventory_name> (no invt_* anywhere).
+
+Required variables
+Hard required (AWX)
+awx_inventory_name (string)
+
+Must be passed as Survey/extra var in AWX Job Template.
+
+Examples: DEV, INTG, PROD
+
+Inputs (come from inventory)
+venafi_renew_certs (dict)
+
+Defined in host_vars or group_vars per host/group. Example:
+
+venafi_renew_certs:
+  ihs_www_example_com:
+    renew_days: 90
+    keystore_type: ["pem"]
+    deploy_dir: "/home/user/Ansible_renewedCerts"
+    deploy_user: "wasadmin"
+    deploy_group: "was"
+    cert_app_config: "IHS"
+
+Optional (defaults exist)
+
+venafi_policy_prefix (default /ved/policy/Automated/certs)
+
+renew_days (default 90)
+
+deploy_dir, deploy_user, deploy_group, deploy_keystore_type
+
+Conflict behavior:
+
+compile_conflict_mode: warn|fail (default warn)
+
+compile_conflict_prefer: prefer_first|prefer_last (default prefer_first)
+
+Gather toggles:
+
+gather_compile_intent: true/false (default true)
+
+Role folder and files (gather/compile only)
+roles/venafi_cert_renew_pipeline/
+  defaults/
+    main.yml
+  tasks/
+    gather_stats.yml
+    compile_intent.yml
+    compile_one_cert.yml
+    conflict_hints.yml
+    combine_inventory_plans.yml
+
+1) defaults/main.yml (gather/compile variables)
+---
+# artifacts / stats variables
+pipeline_intent_var: "venafi_pipeline_intent"
+pipeline_stats_var:  "venafi_pipeline_stats"
+
+# venafi defaults
+venafi_policy_prefix: "/ved/policy/Automated/certs"
+
+# compile defaults
+renew_days: 90
+
+deploy_dir:   "/home/user/Ansible_renewedCerts"
+deploy_user:  "wasadmin"
+deploy_group: "was"
+deploy_keystore_type: ["pem"]
+
+# gather controls
+gather_compile_intent: true
+
+# conflict behavior during compile (within the same inventory)
+compile_conflict_mode: "warn"            # warn|fail
+compile_conflict_prefer: "prefer_first"  # prefer_first|prefer_last
+
+2) tasks/gather_stats.yml (entrypoint: compile + combine)
+---
+# 1) compile: creates Inv_cert_plan_<awx_inventory_name>
+- name: gather_stats | compile per-inventory plan (Inv_cert_plan_<awx_inventory_name>)
+  when: gather_compile_intent | default(true) | bool
+  import_tasks: compile_intent.yml
+  tags: [always]
+
+# 2) combine: merges all Inv_cert_plan_* found into venafi_cert_final_plan
+- name: gather_stats | combine Inv_cert_plan_* -> venafi_cert_final_plan
+  import_tasks: combine_inventory_plans.yml
+  tags: [always]
+
+# 3) expose final plan as runtime facts for other stages (precheck/renew/deploy)
+- name: gather_stats | expose final plan to runtime vars
+  set_fact:
+    compiled_cert_plan: "{{ (hostvars['localhost'].venafi_cert_final_plan.compiled_cert_plan | default({})) }}"
+    cert_names: "{{ (hostvars['localhost'].venafi_cert_final_plan.cert_names | default([])) }}"
+  run_once: true
+  delegate_to: localhost
+  tags: [always]
+
+# optional debug summary
+- name: gather_stats | summary
+  debug:
+    msg:
+      - "Final plan cert count: {{ (compiled_cert_plan | default({}) | length) }}"
+      - "Final cert_names: {{ (cert_names | default([])) }}"
+      - "Sources: {{ (hostvars['localhost'].venafi_cert_final_plan.sources | default([])) }}"
+      - "Collisions: {{ (hostvars['localhost'].venafi_cert_final_plan.collision_count | default(0)) }}"
+  run_once: true
+  delegate_to: localhost
+  tags: [always]
+
+3) tasks/compile_intent.yml (build per-inventory plan + set_stats)
+
+✅ Reads all hosts’ venafi_renew_certs
+✅ Detects conflicts within inventory
+✅ Builds compiled_cert_plan[cert] including deploy_hosts union
+✅ Publishes only: Inv_cert_plan_<awx_inventory_name>
+
+---
+- name: compile_intent | init
+  set_fact:
+    __defs: []
+    __plan: {}
+    __conflicts: []
+    __conflict_hints: []
+    __hosts_sorted: "{{ (groups['all'] | default([])) | sort }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | require awx_inventory_name
+  assert:
+    that:
+      - (awx_inventory_name | default('') | length) > 0
+  fail_msg: "awx_inventory_name is required (pass via AWX survey/extra vars)."
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | compute inventory id + stats var name
+  vars:
+    _inv_name: "{{ awx_inventory_name }}"
+    _inv_id: "{{ (_inv_name | regex_replace('[^A-Za-z0-9_]+','_')) }}"
+  set_fact:
+    __inv_name: "{{ _inv_name }}"
+    __inv_id: "{{ _inv_id }}"
+    __Inv_plan_var: "Inv_cert_plan_{{ _inv_id }}"
+  run_once: true
+  delegate_to: localhost
+
+# Collect all per-host cert definitions into a flat list
+- name: compile_intent | collect definitions from inventory hosts
+  vars:
+    _vh: "{{ hostvars[item] | default({}) }}"
+    _src: "{{ _vh.venafi_renew_certs | default({}) }}"
+    _items: "{{ _src | dict2items }}"
+  loop: "{{ __hosts_sorted }}"
+  loop_control: { loop_var: item }
+  when: (_src | length) > 0
+  set_fact:
+    __defs: "{{ __defs + (_items | map('combine', {'host': item}) | list) }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | unique cert list
+  set_fact:
+    __certs: "{{ (__defs | map(attribute='key') | list | unique) }}"
+  run_once: true
+  delegate_to: localhost
+
+# Per cert compile (conflict-aware)
+- name: compile_intent | compile per cert
+  include_tasks: compile_one_cert.yml
+  loop: "{{ __certs }}"
+  loop_control:
+    loop_var: cert
+    label: "{{ cert }}"
+  vars:
+    _defs_for_cert: "{{ __defs | selectattr('key','equalto', cert) | list }}"
+  run_once: true
+  delegate_to: localhost
+
+# Create human hints for conflicts
+- name: compile_intent | build conflict hints
+  when: (__conflicts | length) > 0
+  import_tasks: conflict_hints.yml
+  run_once: true
+  delegate_to: localhost
+
+# Publish per-inventory plan variable
+- name: compile_intent | set_stats per inventory (Inv_cert_plan_<inv>)
+  set_stats:
+    data:
+      "{{ __Inv_plan_var }}": >-
+        {{
+          (hostvars['localhost'][__Inv_plan_var] | default({}))
+          | combine({
+              'inventory_name': __inv_name,
+              'inventory_id': __inv_id,
+              'compiled_cert_plan': __plan,
+              'cert_names': (__plan.keys() | list),
+              'compile_conflicts': __conflicts,
+              'compile_conflict_count': (__conflicts | length),
+              'compile_conflict_hints': (__conflict_hints | default([]))
+            }, recursive=True)
+        }}
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | summary
+  debug:
+    msg:
+      - "AWX Inventory name: {{ __inv_name }}"
+      - "Published var: {{ __Inv_plan_var }}"
+      - "Cert count: {{ __plan | length }}"
+      - "Conflicts: {{ __conflicts | length }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | fail on conflicts (fail mode)
+  when: (compile_conflict_mode | default('warn')) == 'fail' and (__conflicts | length) > 0
+  assert:
+    that: [ "false" ]
+    fail_msg: >
+      compile_intent found {{ __conflicts | length }} conflict(s) across hosts within inventory {{ __inv_name }}.
+      Fix duplicates or set compile_conflict_mode=warn to continue.
+  run_once: true
+  delegate_to: localhost
+
+4) tasks/compile_one_cert.yml (the per-cert compiler)
+
+This file:
+
+normalizes definitions from multiple hosts
+
+applies defaults
+
+unions deploy hosts
+
+chooses scalar values based on compile_conflict_prefer
+
+records conflicts when multiple hosts disagree
+
+---
+- name: compile_one_cert | init normalized list
+  set_fact:
+    __n: []
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | normalize per host definition
+  loop: "{{ _defs_for_cert }}"
+  loop_control:
+    loop_var: d
+    label: "{{ d.host }}"
+  vars:
+    _raw: "{{ d.value }}"
+    _def: >-
+      {{
+        (_raw[0] if ( _raw is sequence and (_raw is not string) and (_raw|length)>0 ) else (_raw | default({})))
+        if (_raw is not string) else {}
+      }}
+  set_fact:
+    __n: "{{ __n + [ {'host': d.host, 'def': (_def | default({})) } ] }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | init accumulators
+  set_fact:
+    __hosts: []
+    __kt: []
+    __renew_vals: []
+    __pickup_src: []
+    __dir_src: []
+    __user_src: []
+    __group_src: []
+    __app_src: []
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | accumulate fields
+  loop: "{{ __n }}"
+  loop_control:
+    loop_var: x
+    label: "{{ x.host }}"
+  vars:
+    _d: "{{ x.def | default({}) }}"
+    _pickup: "{{ (_d.pickup_id | default('')) | string }}"
+    _dir:    "{{ (_d.deploy_dir | default('')) | string }}"
+    _user:   "{{ (_d.deploy_user | default('')) | string }}"
+    _group:  "{{ (_d.deploy_group | default('')) | string }}"
+    _app:    "{{ (_d.cert_app_config | default('')) | string }}"
+    _renew:  "{{ (_d.renew_days | default('')) }}"
+    _kt_raw: "{{ _d.keystore_type | default(omit) }}"
+  set_fact:
+    __hosts: "{{ __hosts + [ x.host ] }}"
+    __pickup_src: "{{ __pickup_src + ( (_pickup | length) > 0 | ternary([{'host': x.host, 'value': _pickup}], []) ) }}"
+    __dir_src:    "{{ __dir_src    + ( (_dir    | length) > 0 | ternary([{'host': x.host, 'value': _dir   }], []) ) }}"
+    __user_src:   "{{ __user_src   + ( (_user   | length) > 0 | ternary([{'host': x.host, 'value': _user  }], []) ) }}"
+    __group_src:  "{{ __group_src  + ( (_group  | length) > 0 | ternary([{'host': x.host, 'value': _group }], []) ) }}"
+    __app_src:    "{{ __app_src    + ( (_app    | length) > 0 | ternary([{'host': x.host, 'value': _app   }], []) ) }}"
+    __renew_vals: "{{ __renew_vals + ( (_renew | string | length) > 0 | ternary([ (_renew | int) ], []) ) }}"
+    __kt: >-
+      {{
+        __kt + (
+          (_kt_raw is defined)
+          | ternary(
+              ( (_kt_raw is string) | ternary([_kt_raw], (_kt_raw if (_kt_raw is sequence) else [])) ),
+              []
+            )
+        )
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | unique value sets
+  set_fact:
+    __pickup_vals: "{{ __pickup_src | map(attribute='value') | list | unique }}"
+    __dir_vals:    "{{ __dir_src    | map(attribute='value') | list | unique }}"
+    __user_vals:   "{{ __user_src   | map(attribute='value') | list | unique }}"
+    __group_vals:  "{{ __group_src  | map(attribute='value') | list | unique }}"
+    __app_vals:    "{{ __app_src    | map(attribute='value') | list | unique }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | choose scalar values
+  vars:
+    _prefer_last: "{{ (compile_conflict_prefer | default('prefer_first')) == 'prefer_last' }}"
+    _prefix: "{{ venafi_policy_prefix | default('/ved/policy/Automated/certs') }}"
+    _sorted_pick: "{{ __pickup_src | sort(attribute='host') | map(attribute='value') | list }}"
+    _sorted_dir:  "{{ __dir_src    | sort(attribute='host') | map(attribute='value') | list }}"
+    _sorted_user: "{{ __user_src   | sort(attribute='host') | map(attribute='value') | list }}"
+    _sorted_grp:  "{{ __group_src  | sort(attribute='host') | map(attribute='value') | list }}"
+    _sorted_app:  "{{ __app_src    | sort(attribute='host') | map(attribute='value') | list }}"
+  set_fact:
+    __pickup_chosen: >-
+      {{
+        (_sorted_pick[-1] if (_prefer_last and (_sorted_pick|length)>0)
+         else (_sorted_pick[0] if (_sorted_pick|length)>0 else (_prefix ~ '/' ~ cert)))
+      }}
+    __dir_chosen: >-
+      {{
+        (_sorted_dir[-1] if (_prefer_last and (_sorted_dir|length)>0)
+         else (_sorted_dir[0] if (_sorted_dir|length)>0 else (deploy_dir | default('/home/user/Ansible_renewedCerts'))))
+      }}
+    __user_chosen: >-
+      {{
+        (_sorted_user[-1] if (_prefer_last and (_sorted_user|length)>0)
+         else (_sorted_user[0] if (_sorted_user|length)>0 else (deploy_user | default('wasadmin'))))
+      }}
+    __group_chosen: >-
+      {{
+        (_sorted_grp[-1] if (_prefer_last and (_sorted_grp|length)>0)
+         else (_sorted_grp[0] if (_sorted_grp|length)>0 else (deploy_group | default('was'))))
+      }}
+    __app_chosen: >-
+      {{
+        (_sorted_app[-1] if (_prefer_last and (_sorted_app|length)>0)
+         else (_sorted_app[0] if (_sorted_app|length)>0 else ''))
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | choose renew/keystore safely
+  set_fact:
+    __renew_chosen: "{{ (__renew_vals | length) > 0 | ternary((__renew_vals | max), (renew_days | default(90) | int)) }}"
+    __kt_chosen:    "{{ (__kt | length) > 0 | ternary((__kt | unique | list), (deploy_keystore_type | default(['pem'])) ) }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | record conflicts (scalar fields)
+  set_fact:
+    __conflicts: >-
+      {{
+        __conflicts
+        + ( (__pickup_vals | length > 1) | ternary([{'cert': cert,'field':'pickup_id','sources':__pickup_src,'chosen':__pickup_chosen}], []) )
+        + ( (__dir_vals    | length > 1) | ternary([{'cert': cert,'field':'deploy_dir','sources':__dir_src,'chosen':__dir_chosen}], []) )
+        + ( (__user_vals   | length > 1) | ternary([{'cert': cert,'field':'deploy_user','sources':__user_src,'chosen':__user_chosen}], []) )
+        + ( (__group_vals  | length > 1) | ternary([{'cert': cert,'field':'deploy_group','sources':__group_src,'chosen':__group_chosen}], []) )
+        + ( (__app_vals    | length > 1) | ternary([{'cert': cert,'field':'cert_app_config','sources':__app_src,'chosen':__app_chosen}], []) )
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_one_cert | update compiled plan (deploy_hosts union)
+  set_fact:
+    __plan: >-
+      {{
+        __plan | combine({
+          (cert): {
+            'pickup_id': __pickup_chosen,
+            'renew_days': (__renew_chosen | int),
+            'keystore_type': (__kt_chosen | list),
+            'deploy_dir': __dir_chosen,
+            'deploy_user': __user_chosen,
+            'deploy_group': __group_chosen,
+            'cert_app_config': __app_chosen,
+            'deploy_hosts': (__hosts | unique | list)
+          }
+        }, recursive=True)
+      }}
+  run_once: true
+  delegate_to: localhost
+
+5) tasks/conflict_hints.yml (optional improvement)
+---
+- name: conflict_hints | init
+  set_fact:
+    __conflict_hints: []
+  run_once: true
+  delegate_to: localhost
+
+- name: conflict_hints | build hint per conflict
+  loop: "{{ __conflicts }}"
+  loop_control:
+    loop_var: c
+    label: "{{ c.cert }}:{{ c.field }}"
+  vars:
+    _f: "{{ c.field | default('') }}"
+    _hint: >-
+      {{
+        (_f == 'deploy_dir')
+        | ternary('deploy_dir differs across hosts. Keep venafi_renew_certs consistent; prefer deploy overrides in cert_deploy_matrix.',
+          (_f == 'deploy_user')
+          | ternary('deploy_user differs. Standardize via group_vars; host-specific overrides should move to cert_deploy_matrix.',
+            (_f == 'deploy_group')
+            | ternary('deploy_group differs. Standardize via group_vars; host-specific overrides should move to cert_deploy_matrix.',
+              (_f == 'pickup_id')
+              | ternary('pickup_id differs. This is risky; define pickup_id once per cert to avoid renewing wrong Venafi object.',
+                (_f == 'cert_app_config')
+                | ternary('cert_app_config differs. Treat it as metadata; keep consistent.',
+                         'Conflict detected. Consolidate duplicate definitions.'
+                )
+              )
+            )
+          )
+        )
+      }}
+  set_fact:
+    __conflict_hints: "{{ __conflict_hints + [ {'cert': c.cert, 'field': c.field, 'chosen': (c.chosen|default('')), 'hosts': (c.sources|default([])|map(attribute='host')|list), 'hint': _hint } ] }}"
+  run_once: true
+  delegate_to: localhost
+
+6) tasks/combine_inventory_plans.yml (combine all Inv_cert_plan_*)
+---
+- name: combine_plans | discover Inv_cert_plan_* vars on localhost
+  vars:
+    _lv: "{{ hostvars['localhost'] | default({}) }}"
+  set_fact:
+    __inv_plan_keys: >-
+      {{
+        (_lv.keys() | list)
+        | select('match','^Inv_cert_plan_')
+        | list
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | init final aggregates
+  set_fact:
+    __final_plan: {}
+    __final_sources: []
+    __final_conflicts: []
+    __final_hints: []
+    __final_collisions: []
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | merge all inventory plan vars found
+  loop: "{{ __inv_plan_keys }}"
+  loop_control: { loop_var: k, label: "{{ k }}" }
+  vars:
+    _obj: "{{ hostvars['localhost'][k] | default({}) }}"
+    _inv: "{{ _obj.inventory_id | default(k) }}"
+    _plan: "{{ _obj.compiled_cert_plan | default({}) }}"
+  block:
+    - name: combine_plans | add source + carry conflict lists
+      set_fact:
+        __final_sources: "{{ __final_sources + [k] }}"
+        __final_conflicts: "{{ __final_conflicts + (_obj.compile_conflicts | default([])) }}"
+        __final_hints: "{{ __final_hints + (_obj.compile_conflict_hints | default([])) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: combine_plans | merge cert records (collision-safe)
+      loop: "{{ (_plan | dict2items) }}"
+      loop_control: { loop_var: c, label: "{{ c.key }}" }
+      vars:
+        _cert: "{{ c.key }}"
+        _rec:  "{{ c.value | default({}) }}"
+        _exists: "{{ __final_plan.get(_cert) is defined }}"
+        _same: "{{ _exists and (__final_plan.get(_cert) == _rec) }}"
+        _newkey: "{{ _cert ~ '__' ~ (_inv | string) }}"
+      set_fact:
+        __final_plan: >-
+          {{
+            __final_plan
+            | combine(
+                (
+                  (_exists and (not _same))
+                  | ternary({ (_newkey): (_rec | combine({'source_inventory': _inv}, recursive=True)) },
+                            { (_cert): (_rec | combine({'source_inventory': _inv}, recursive=True)) })
+                ),
+                recursive=True
+              )
+          }}
+        __final_collisions: >-
+          {{
+            __final_collisions
+            + (
+                (_exists and (not _same))
+                | ternary([{'cert': _cert, 'incoming_inventory': _inv, 'stored_as': _newkey}], [])
+              )
+          }}
+      run_once: true
+      delegate_to: localhost
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | publish venafi_cert_final_plan
+  set_stats:
+    data:
+      venafi_cert_final_plan:
+        sources: "{{ __final_sources | unique | list }}"
+        inventories_found: "{{ (__final_sources | unique | list) | length }}"
+        compiled_cert_plan: "{{ __final_plan }}"
+        cert_names: "{{ __final_plan.keys() | list }}"
+        collision_count: "{{ __final_collisions | length }}"
+        collisions: "{{ __final_collisions }}"
+        compile_conflicts: "{{ __final_conflicts }}"
+        compile_conflict_hints: "{{ __final_hints }}"
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+# Backward compatibility for existing pipeline usage
+- name: combine_plans | publish compatibility intent var
+  set_stats:
+    data:
+      "{{ pipeline_intent_var }}":
+        compiled_cert_plan: "{{ __final_plan }}"
+        cert_names: "{{ __final_plan.keys() | list }}"
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+What gets created (outputs)
+
+After gather_stats.yml runs:
+
+Per-inventory:
+
+hostvars['localhost'].Inv_cert_plan_<awx_inventory_name>
+
+Example:
+
+Inv_cert_plan_DEV:
+  inventory_name: DEV
+  compiled_cert_plan: {...}
+  cert_names: [...]
+
+Combined:
+
+hostvars['localhost'].venafi_cert_final_plan
+
+And compatibility:
+
+hostvars['localhost'].venafi_pipeline_intent.compiled_cert_plan
+
+hostvars['localhost'].venafi_pipeline_intent.cert_names
+
+If you want, I can also show a sample debug dump of Inv_cert_plan_DEV and venafi_cert_final_plan exactly as it will look in AWX artifacts.
