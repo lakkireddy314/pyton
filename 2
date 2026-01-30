@@ -1,0 +1,529 @@
+Required parameter (AWX)
+Required
+
+awx_inventory_name (string) — passed via Survey / extra vars
+Examples: DEV, INTG, PROD
+
+Optional but recommended
+
+compile_conflict_mode: warn|fail (default warn)
+
+compile_conflict_prefer: prefer_first|prefer_last (default prefer_first)
+
+require_intent: true|false (default false)
+
+Playbooks
+playbooks/pipeline.yml
+---
+- hosts: localhost
+  gather_facts: false
+
+  vars:
+    pipeline_intent_var: "venafi_pipeline_intent"
+    pipeline_stats_var:  "venafi_pipeline_stats"
+
+    venafi_policy_prefix: "/ved/policy/Automated/certs"
+    vcert_bin: "/usr/local/bin/vcert"
+    openssl_bin: "/usr/bin/openssl"
+    keytool_bin: "/usr/bin/keytool"
+
+    # compile / conflict behavior
+    gather_compile_intent: true
+    gather_validate_intent: true
+    compile_conflict_mode: "warn"            # warn|fail
+    compile_conflict_prefer: "prefer_first"  # prefer_first|prefer_last
+
+    # reports
+    renew_report: true
+    smtp_host: "mail.yourorg.internal"
+    smtp_port: 25
+    user_email: "tls-ops@yourorg.com"
+
+    # deploy defaults
+    deploy_stage_root: "/tmp/venafi_deploy"
+    deploy_dir: "/home/user/Ansible_renewedCerts"
+    deploy_user: "wasadmin"
+    deploy_group: "was"
+    deploy_keystore_type: ["pem"]
+
+    require_intent: false
+
+  tasks:
+    - name: pipeline | gather stats (compile Inv_cert_plan_* + combine -> venafi_cert_final_plan)
+      include_role:
+        name: venafi_cert_renew_pipeline
+        tasks_from: gather_stats.yml
+      tags: [always]
+
+    - name: pipeline | precheck
+      include_role:
+        name: venafi_cert_renew_pipeline
+        tasks_from: precheck.yml
+      tags: [precheck]
+
+    - name: pipeline | renew
+      include_role:
+        name: venafi_cert_renew_pipeline
+        tasks_from: renew.yml
+      tags: [renew]
+
+    - name: pipeline | deploy
+      include_role:
+        name: venafi_cert_renew_pipeline
+        tasks_from: deploy.yml
+      tags: [deploy]
+
+playbooks/compile.yml (optional compile-only)
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: compile | gather_stats (compile + combine only)
+      include_role:
+        name: venafi_cert_renew_pipeline
+        tasks_from: gather_stats.yml
+      vars:
+        gather_compile_intent: true
+        gather_validate_intent: false
+        require_intent: false
+      tags: [always]
+
+Group vars (examples)
+group_vars/all.yml
+venafi_policy_prefix: "/ved/policy/Automated/certs"
+renew_days: 90
+
+deploy_dir: "/home/user/Ansible_renewedCerts"
+deploy_user: "wasadmin"
+deploy_group: "was"
+deploy_keystore_type: ["pem"]
+
+cert_deploy_matrix: {}
+
+Final role
+Tree
+roles/venafi_cert_renew_pipeline/
+  defaults/main.yml
+  tasks/
+    gather_stats.yml
+    compile_intent.yml
+    compile_one_cert.yml
+    combine_inventory_plans.yml
+    conflict_hints.yml
+
+    precheck.yml
+    precheck_standalone.yml
+    precheck_per_cert.yml
+
+    renew.yml
+    renew_standalone.yml
+    renew_per_cert.yml
+    renew_report.yml
+
+    deploy.yml
+    deploy_from_stats.yml
+    deploy_standalone.yml
+  templates/
+    report_dry.html.j2
+    report_renew.html.j2
+
+defaults/main.yml
+---
+pipeline_intent_var: "venafi_pipeline_intent"
+pipeline_stats_var:  "venafi_pipeline_stats"
+
+venafi_policy_prefix: "/ved/policy/Automated/certs"
+
+vcert_bin:   "/usr/local/bin/vcert"
+openssl_bin: "/usr/bin/openssl"
+keytool_bin: "/usr/bin/keytool"
+
+expected_validity_days: 730
+renew_days: 90
+
+renew_report: true
+smtp_host: ""
+smtp_port: 25
+user_email: ""
+
+deploy_stage_root: "/tmp/venafi_deploy"
+deploy_user:  "wasadmin"
+deploy_group: "was"
+deploy_dir:   "/home/user/Ansible_renewedCerts"
+deploy_keystore_type: ["pem"]
+
+deploy_after_renew: false
+
+gather_compile_intent: true
+gather_validate_intent: true
+
+compile_conflict_mode: "warn"            # warn|fail
+compile_conflict_prefer: "prefer_first"  # prefer_first|prefer_last
+
+tasks/gather_stats.yml
+---
+- name: gather_stats | compile per-inventory plan (Inv_cert_plan_<awx_inventory_name>)
+  when: gather_compile_intent | default(true) | bool
+  import_tasks: compile_intent.yml
+  tags: [always]
+
+- name: gather_stats | combine Inv_cert_plan_* -> venafi_cert_final_plan
+  import_tasks: combine_inventory_plans.yml
+  tags: [always]
+
+- name: gather_stats | expose final plan to runtime vars
+  set_fact:
+    compiled_cert_plan: "{{ (hostvars['localhost'].venafi_cert_final_plan.compiled_cert_plan | default({})) }}"
+    cert_names: "{{ (hostvars['localhost'].venafi_cert_final_plan.cert_names | default([])) }}"
+  run_once: true
+  delegate_to: localhost
+  tags: [always]
+
+- name: gather_stats | detect requested stages (from tags)
+  set_fact:
+    __want_pre: "{{ 'precheck' in ansible_run_tags or (ansible_run_tags | length == 0) }}"
+    __want_ren: "{{ 'renew' in ansible_run_tags }}"
+    __want_dep: "{{ 'deploy' in ansible_run_tags }}"
+  run_once: true
+  delegate_to: localhost
+  tags: [always]
+
+- name: gather_stats | validator (require intent unless standalone)
+  when: gather_validate_intent | default(true) | bool
+  assert:
+    that:
+      - >
+        not (require_intent | default(false) | bool) or
+        (
+          (not __want_pre or (precheck_mode | default('auto')) == 'standalone')
+          and
+          (not __want_ren or (renew_mode    | default('auto')) == 'standalone')
+          and
+          (not __want_dep or (deploy_mode   | default('auto')) == 'standalone')
+        )
+        or
+        (
+          (hostvars['localhost'].venafi_cert_final_plan.compiled_cert_plan | default({}) | length) > 0
+        )
+  fail_msg: >
+    This job expects intent artifacts but none were found (venafi_cert_final_plan is empty).
+    Ensure compile runs (gather_compile_intent=true) or run compile job first and enable “Pass artifacts”,
+    or run this stage in standalone mode.
+  run_once: true
+  delegate_to: localhost
+  tags: [always]
+
+tasks/compile_intent.yml ✅ ONLY publishes Inv_cert_plan_<inv>
+---
+- name: compile_intent | init
+  set_fact:
+    __defs: []
+    __plan: {}
+    __conflicts: []
+    __conflict_hints: []
+    __hosts_sorted: "{{ (groups['all'] | default([])) | sort }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | require awx_inventory_name
+  assert:
+    that:
+      - (awx_inventory_name | default('') | length) > 0
+  fail_msg: "awx_inventory_name is required (pass via AWX survey/extra vars)."
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | compute inventory id + stats var name
+  vars:
+    _inv_name: "{{ awx_inventory_name }}"
+    _inv_id: "{{ (_inv_name | regex_replace('[^A-Za-z0-9_]+','_')) }}"
+  set_fact:
+    __inv_name: "{{ _inv_name }}"
+    __inv_id: "{{ _inv_id }}"
+    __Inv_plan_var: "Inv_cert_plan_{{ _inv_id }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | collect definitions from inventory hosts
+  vars:
+    _vh: "{{ hostvars[item] | default({}) }}"
+    _src: "{{ _vh.venafi_renew_certs | default({}) }}"
+    _items: "{{ _src | dict2items }}"
+  loop: "{{ __hosts_sorted }}"
+  loop_control: { loop_var: item }
+  when: (_src | length) > 0
+  set_fact:
+    __defs: "{{ __defs + (_items | map('combine', {'host': item}) | list) }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | unique cert list
+  set_fact:
+    __certs: "{{ (__defs | map(attribute='key') | list | unique) }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | compile per cert (conflict-aware)
+  include_tasks: compile_one_cert.yml
+  loop: "{{ __certs }}"
+  loop_control:
+    loop_var: cert
+    label: "{{ cert }}"
+  vars:
+    _defs_for_cert: "{{ __defs | selectattr('key','equalto', cert) | list }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | build conflict hints
+  when: (__conflicts | length) > 0
+  import_tasks: conflict_hints.yml
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | set_stats per inventory (Inv_cert_plan_<inv>)
+  set_stats:
+    data:
+      "{{ __Inv_plan_var }}": >-
+        {{
+          (hostvars['localhost'][__Inv_plan_var] | default({}))
+          | combine({
+              'inventory_name': __inv_name,
+              'inventory_id': __inv_id,
+              'compiled_cert_plan': __plan,
+              'cert_names': (__plan.keys() | list),
+              'compile_conflicts': __conflicts,
+              'compile_conflict_count': (__conflicts | length),
+              'compile_conflict_hints': (__conflict_hints | default([]))
+            }, recursive=True)
+        }}
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | summary
+  debug:
+    msg:
+      - "AWX Inventory name: {{ __inv_name }}"
+      - "Published var: {{ __Inv_plan_var }}"
+      - "Cert count: {{ __plan | length }}"
+      - "Conflicts: {{ __conflicts | length }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: compile_intent | fail on conflicts (fail mode)
+  when: (compile_conflict_mode | default('warn')) == 'fail' and (__conflicts | length) > 0
+  assert:
+    that: [ "false" ]
+    fail_msg: >
+      compile_intent found {{ __conflicts | length }} conflict(s) across hosts within inventory {{ __inv_name }}.
+      Fix duplicates or set compile_conflict_mode=warn to continue.
+  run_once: true
+  delegate_to: localhost
+
+tasks/combine_inventory_plans.yml ✅ looks only for Inv_cert_plan_*
+---
+- name: combine_plans | discover Inv_cert_plan_* vars on localhost
+  vars:
+    _lv: "{{ hostvars['localhost'] | default({}) }}"
+  set_fact:
+    __inv_plan_keys: >-
+      {{
+        (_lv.keys() | list)
+        | select('match','^Inv_cert_plan_')
+        | list
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | init final aggregates
+  set_fact:
+    __final_plan: {}
+    __final_sources: []
+    __final_conflicts: []
+    __final_hints: []
+    __final_collisions: []
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | merge all inventory plan vars found
+  loop: "{{ __inv_plan_keys }}"
+  loop_control: { loop_var: k, label: "{{ k }}" }
+  vars:
+    _obj: "{{ hostvars['localhost'][k] | default({}) }}"
+    _inv: "{{ _obj.inventory_id | default(k) }}"
+    _plan: "{{ _obj.compiled_cert_plan | default({}) }}"
+  block:
+    - name: combine_plans | add source + carry conflict lists
+      set_fact:
+        __final_sources: "{{ __final_sources + [k] }}"
+        __final_conflicts: "{{ __final_conflicts + (_obj.compile_conflicts | default([])) }}"
+        __final_hints: "{{ __final_hints + (_obj.compile_conflict_hints | default([])) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: combine_plans | merge cert records (collision-safe)
+      loop: "{{ (_plan | dict2items) }}"
+      loop_control: { loop_var: c, label: "{{ c.key }}" }
+      vars:
+        _cert: "{{ c.key }}"
+        _rec:  "{{ c.value | default({}) }}"
+        _exists: "{{ __final_plan.get(_cert) is defined }}"
+        _same: "{{ _exists and (__final_plan.get(_cert) == _rec) }}"
+        _newkey: "{{ _cert ~ '__' ~ (_inv | string) }}"
+      set_fact:
+        __final_plan: >-
+          {{
+            __final_plan
+            | combine(
+                (
+                  (_exists and (not _same))
+                  | ternary({ (_newkey): (_rec | combine({'source_inventory': _inv}, recursive=True)) },
+                            { (_cert): (_rec | combine({'source_inventory': _inv}, recursive=True)) })
+                ),
+                recursive=True
+              )
+          }}
+        __final_collisions: >-
+          {{
+            __final_collisions
+            + (
+                (_exists and (not _same))
+                | ternary([{'cert': _cert, 'incoming_inventory': _inv, 'stored_as': _newkey}], [])
+              )
+          }}
+      run_once: true
+      delegate_to: localhost
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | publish venafi_cert_final_plan
+  set_stats:
+    data:
+      venafi_cert_final_plan:
+        sources: "{{ __final_sources | unique | list }}"
+        inventories_found: "{{ (__final_sources | unique | list) | length }}"
+        compiled_cert_plan: "{{ __final_plan }}"
+        cert_names: "{{ __final_plan.keys() | list }}"
+        collision_count: "{{ __final_collisions | length }}"
+        collisions: "{{ __final_collisions }}"
+        compile_conflicts: "{{ __final_conflicts }}"
+        compile_conflict_hints: "{{ __final_hints }}"
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+- name: combine_plans | publish compatibility intent var
+  set_stats:
+    data:
+      "{{ pipeline_intent_var }}":
+        compiled_cert_plan: "{{ __final_plan }}"
+        cert_names: "{{ __final_plan.keys() | list }}"
+    aggregate: true
+  run_once: true
+  delegate_to: localhost
+
+tasks/conflict_hints.yml (same as before)
+
+(kept; optional feature)
+
+---
+- name: conflict_hints | init
+  set_fact:
+    __conflict_hints: []
+  run_once: true
+  delegate_to: localhost
+
+- name: conflict_hints | build hint per conflict
+  loop: "{{ __conflicts }}"
+  loop_control:
+    loop_var: c
+    label: "{{ c.cert }}:{{ c.field }}"
+  vars:
+    _f: "{{ c.field | default('') }}"
+    _hint: >-
+      {{
+        (_f == 'deploy_dir')
+        | ternary('deploy_dir differs across hosts. Keep venafi_renew_certs minimal/consistent; put host/env overrides into cert_deploy_matrix (deploy stage).',
+          (_f == 'deploy_user')
+          | ternary('deploy_user differs. Standardize in defaults/group_vars; if host-specific, use cert_deploy_matrix or group vars by host group.',
+            (_f == 'deploy_group')
+            | ternary('deploy_group differs. Standardize in defaults/group_vars; if host-specific, use cert_deploy_matrix or group vars.',
+              (_f == 'pickup_id')
+              | ternary('pickup_id differs. Usually should be global per cert; define it once to avoid renewing the wrong Venafi object.',
+                (_f == 'cert_app_config')
+                | ternary('cert_app_config differs. Treat as metadata; keep consistent or store host-specific info outside venafi_renew_certs.',
+                         'Conflict detected. Consolidate duplicate definitions for this cert.'
+                )
+              )
+            )
+          )
+        )
+      }}
+  set_fact:
+    __conflict_hints: "{{ __conflict_hints + [ {'cert': c.cert, 'field': c.field, 'chosen': (c.chosen|default('')), 'hosts': (c.sources|default([])|map(attribute='host')|list), 'hint': _hint } ] }}"
+  run_once: true
+  delegate_to: localhost
+
+Precheck/Renew/Deploy + Templates
+
+Keep your existing stage files unchanged. They will now use:
+
+compiled_cert_plan + cert_names set in gather_stats.yml
+
+and those are derived from venafi_cert_final_plan which comes from combining all Inv_cert_plan_*
+
+Explanations (how it works now)
+Compile stage (inside role)
+
+Reads venafi_renew_certs from all hosts in the current inventory
+
+Builds compiled_cert_plan
+
+Publishes it as one per-inventory stats variable:
+
+Inv_cert_plan_<awx_inventory_name>
+
+Example:
+
+Inv_cert_plan_DEV
+
+Inv_cert_plan_PROD
+
+Combine stage (inside role)
+
+Scans localhost stats for any var matching Inv_cert_plan_*
+
+Merges them into:
+
+venafi_cert_final_plan.compiled_cert_plan
+
+venafi_cert_final_plan.cert_names
+
+Also publishes compatibility:
+
+venafi_pipeline_intent.compiled_cert_plan
+
+venafi_pipeline_intent.cert_names
+
+Pipeline stages
+
+Precheck/Renew/Deploy read from compiled_cert_plan/cert_names
+
+Those are always prepared by gather_stats first.
+
+AWX usage pattern (recommended)
+Workflow node 1 (DEV compile+precheck+renew+deploy)
+
+Extra vars: awx_inventory_name: DEV
+
+Run:
+
+pipeline.yml -t precheck etc (or full pipeline tags)
+
+Workflow node 2 (PROD compile+precheck+renew+deploy)
+
+Extra vars: awx_inventory_name: PROD
+
+If you have a “combine-only” node, it’ll see all Inv_cert_plan_* artifacts passed into it and build the final plan.
+
+If you want, I can also add a combine-only playbook (so you can have a dedicated workflow node that just merges all Inv_cert_plan_* artifacts and prints a summary of final certs + collisions).
